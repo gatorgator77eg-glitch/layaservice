@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "laya-decision-service"
+version = "1.0.0"
+description = "Reusable FastAPI inference endpoint over the Laya decision model"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# Pinned as floors, not tildes, for two reasons: `laya` and `transformers` move
+# fast enough that a range resolves to a combination nobody tested, and the
+# transformer's `InferenceHead`/`AutoModel` surface that `laya` depends on has
+# changed between minor versions. A service that pins nothing here breaks on a
+# dependency bump rather than on a deploy.
+dependencies = [
+    "laya[fast]>=0.3.24",
+    "torch>=2.2",
+    "transformers>=5.0",
+    "fastapi>=0.115",
+    "pydantic>=2.7",
+    "uvicorn[standard]>=0.30",
+    "prometheus-client>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+laya-service = "app.__main__:main"
+
+[tool.setuptools]
+packages = ["app", "app.routes"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: exercises a real checkpoint; needs the weights in the local HF cache",
+]
+# The fake-router tests are the default suite precisely because they need no
+# weights, so `pytest` on a clean checkout verifies the whole HTTP surface in
+# under a second instead of downloading 1.4GB first. Run `-m live` to opt in to
+# the tests that load a real checkpoint.
+addopts = "-q --strict-markers -m 'not live'"
