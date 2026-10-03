@@ -275,6 +275,74 @@ class PredictRequest(BaseModel):
         return kwargs
 
 
+class ProfilePredictRequest(BaseModel):
+    """Body of a minted profile endpoint: a state and per-request controls.
+
+    Identical for every profile -- what differs between profiles is the question
+    set, which the profile supplies and the caller cannot send. That is enforced by
+    ``extra="forbid"`` rather than by stripping keys: a caller who typos
+    ``max_lan`` gets a 422 naming the field instead of silently losing the control
+    they thought they had set.
+
+    ``model`` and ``task`` are absent by design. A profile's checkpoint is part of
+    what makes its calibration meaningful, so a request cannot re-route it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: Union[str, Dict[str, Any], List[Any]] = Field(
+        description="Text, email, ticket or JSON document to decide on.",
+    )
+    lang: Optional[str] = Field(
+        default=None,
+        description="Language hint such as 'de' or 'pt-BR'. Skips detection.",
+    )
+    lang_guess: Optional[str] = Field(
+        default=None,
+        description="Language code from the caller's own identifier. Consulted after `lang`.",
+    )
+    max_len: Optional[int] = Field(default=None, ge=1)
+    head_max_len: Optional[int] = Field(default=None, ge=1)
+    min_confidence: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Overrides this profile's calibrated threshold for one request. Set by a "
+            "calibration the operator fitted; absent means use the profile's."
+        ),
+    )
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def state_must_be_present(cls, value: Any) -> Any:
+        """Reject a null state, matching ``PredictRequest`` exactly.
+
+        The message and status are deliberately identical to the fixed endpoint's:
+        a caller moving between the two should not have to learn a second rule for
+        the same mistake.
+        """
+        if value is None:
+            raise ValueError(
+                "state must not be null; it is the text or document to decide on"
+            )
+        return value
+
+    def controls(self) -> Dict[str, Any]:
+        """Controls the caller actually sent, for layering under the profile's."""
+        return {
+            name: value
+            for name, value in (
+                ("lang", self.lang),
+                ("lang_guess", self.lang_guess),
+                ("max_len", self.max_len),
+                ("head_max_len", self.head_max_len),
+                ("min_confidence", self.min_confidence),
+            )
+            if value is not None
+        }
+
+
 class StateOverride(BaseModel):
     """Per-state controls, for the states in a batch that need something different.
 

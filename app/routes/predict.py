@@ -3,30 +3,38 @@
 ``POST /v1/decisions/predict``       one state, one question set, one forward pass
 ``POST /v1/decisions/predict/batch`` one question set, many states
 
-The handlers are thin on purpose. Guard order is the only thing here with real
-subtlety, and it is fixed:
+The handlers are thin on purpose. Everything from schema validation to the answer
+lives in ``app.decision``, shared with the profile endpoints minted at runtime, so
+guard parity is structural: there is one implementation, and a second one would be
+the one without tests.
 
-    admission -> body size -> JSON -> schema -> question/state size
-    -> body controls -> lone surrogates -> token budgets -> inference
+What stays here is what cannot move into the shared core, because it is genuinely
+specific to these two routes:
 
-Size before schema so an oversized body is refused without being parsed into
-objects first; body controls after the size checks so an oversized request is
-refused rather than having its contents interpreted; surrogates last among the
-pre-inference checks so the walk only ever sees bodies already bounded by the
-character and question limits.
+* reading the body under the byte cap, before anything is parsed
+* the batch shape, which has no profile equivalent -- a minted profile endpoint
+  answers one state, and per-state overrides over a shared question set are the
+  fixed endpoint's job
+
+Guard order for the single-decision path is fixed and documented in
+``app.decision``; for batch it is:
+
+    admission -> body size -> JSON -> schema -> body controls -> lone surrogates
+    -> token budgets -> question size -> state size -> inference
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from app import limits, metrics
+from app import decision, limits, metrics
+from app.openapi import declare_request_body
 from app.schemas import (
     BatchPredictRequest,
     BatchPredictResponse,
@@ -41,108 +49,15 @@ router = APIRouter(tags=["decisions"])
 ROUTE_PREDICT = "predict"
 ROUTE_BATCH = "batch"
 
+# Both handlers read the body off a raw Request so the byte cap can fire before
+# parsing, which leaves FastAPI with no signature to infer a request schema from.
+# Declaring them here is what keeps the request side of the API in the document.
+declare_request_body("/v1/decisions/predict", "post", PredictRequest)
+declare_request_body("/v1/decisions/predict/batch", "post", BatchPredictRequest)
+
 
 def _engine(request: Request) -> Any:
     return request.app.state.engine
-
-
-def _timing_headers(inference_ms: float) -> Dict[str, str]:
-    """Per-request inference cost, for traces and browser devtools.
-
-    The histogram is the right instrument for percentiles; this is what an
-    individual request reports about itself.
-    """
-    return {
-        "Server-Timing": f"inference;dur={inference_ms:.2f}",
-        "X-Inference-Time-Ms": f"{inference_ms:.2f}",
-    }
-
-
-def _load_request(app: Any, payload: Any, route: str) -> PredictRequest:
-    """Validate the parsed body, converting Pydantic's error shape to a 422."""
-    try:
-        return PredictRequest.model_validate(payload)
-    except ValidationError as exc:
-        metrics.REJECTED.labels(route=route, reason=metrics.REASON_SCHEMA).inc()
-        raise HTTPException(status_code=422, detail=_format_validation_error(exc)) from None
-
-
-def _format_validation_error(exc: ValidationError) -> List[Dict[str, Any]]:
-    """Locate each problem and say what to change about it.
-
-    The point is that a caller can act on a 422. "value is not a valid dict" does
-    not tell anyone which of nine questions was malformed.
-    """
-    formatted = []
-    for error in exc.errors():
-        location = [str(part) for part in error.get("loc", ())]
-        # loc[0] is the body's top-level field; the question id is loc[1] when the
-        # failure is inside `questions`. Surface it as a message so the caller does
-        # not have to know the request shape to find the offending question.
-        if len(location) >= 3 and location[0] == "questions":
-            qid = location[1]
-            leaf = location[-1]
-            message = error.get("msg", "invalid")
-            formatted.append(
-                {
-                    "loc": location,
-                    "msg": f"question {qid!r}: {message}",
-                    "question": qid,
-                    "field": leaf,
-                }
-            )
-        else:
-            formatted.append(
-                {
-                    "loc": location,
-                    "msg": error.get("msg", "invalid"),
-                    "field": location[-1] if location else None,
-                }
-            )
-    return formatted
-
-
-def _guard(payload: Dict[str, Any], request_model: Any, cfg: Any, route: str) -> None:
-    """Everything between parsing and inference, in the fixed order."""
-    try:
-        limits.refuse_body_controls(payload)
-    except HTTPException:
-        metrics.REJECTED.labels(route=route, reason=metrics.REASON_BODY_CONTROL).inc()
-        raise
-
-    if limits.has_lone_surrogate(payload):
-        metrics.REJECTED.labels(route=route, reason=metrics.REASON_SURROGATE).inc()
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "request body contains an unpaired surrogate escape; those cannot be "
-                "encoded as UTF-8"
-            ),
-        )
-
-    questions = request_model.questions
-    for name in ("max_len", "head_max_len"):
-        try:
-            limits.clamp_budget(name, getattr(request_model, name), cfg.limits.token_budget)
-        except HTTPException:
-            metrics.REJECTED.labels(route=route, reason=metrics.REASON_BUDGET).inc()
-            raise
-
-
-def _check_questions(request_model: Any, cfg: Any, route: str) -> None:
-    try:
-        limits.check_question_count(request_model.questions, cfg.limits.questions)
-        limits.check_option_weights(
-            request_model.questions,
-            max_choice_options=cfg.limits.choice_options,
-            max_score_levels=cfg.limits.score_levels,
-            max_total_options=cfg.limits.total_options,
-        )
-    except HTTPException:
-        # The specific reason is not recoverable from the exception type, so the
-        # coarse reason is recorded here and the detail carries the specifics.
-        metrics.REJECTED.labels(route=route, reason=metrics.REASON_TOTAL_OPTIONS).inc()
-        raise
 
 
 @router.post(
@@ -165,13 +80,9 @@ def _check_questions(request_model: Any, cfg: Any, route: str) -> None:
     summary="Decide typed questions over one state",
 )
 async def predict(request: Request) -> JSONResponse:
-    engine = _engine(request)
-    cfg = request.app.state.config
-    started = time.perf_counter()
-
-    async with engine.admit():
+    async with _engine(request).admit():
         try:
-            raw = await limits.read_body_capped(request, cfg.limits.body_bytes)
+            raw = await limits.read_body_capped(request, request.app.state.config.limits.body_bytes)
         except HTTPException:
             metrics.REJECTED.labels(route=ROUTE_PREDICT, reason=metrics.REASON_BODY).inc()
             raise
@@ -182,59 +93,12 @@ async def predict(request: Request) -> JSONResponse:
             metrics.REJECTED.labels(route=ROUTE_PREDICT, reason=metrics.REASON_JSON).inc()
             raise
 
-        request_model = _load_request(request.app, payload, ROUTE_PREDICT)
-        _guard(payload, request_model, cfg, ROUTE_PREDICT)
-        _check_questions(request_model, cfg, ROUTE_PREDICT)
-
-        try:
-            limits.check_state(request_model.state, cfg.limits.state_chars)
-        except HTTPException:
-            metrics.REJECTED.labels(route=ROUTE_PREDICT, reason=metrics.REASON_STATE).inc()
-            raise
-
-        model_name = limits.resolve_model(request_model.model)
-        kwargs = request_model.predict_kwargs()
-        n_questions = len(request_model.questions)
-
-        try:
-            result, inference_ms, queue_s = await engine.run(
-                engine.router.predict,
-                state=request_model.state,
-                questions=request_model.as_laya_questions(),
-                model=model_name,
-                **kwargs,
-            )
-        except HTTPException:
-            raise
-        except ValueError as exc:
-            # Question validation from core: names the question and what to fix,
-            # so it is safe to return.
-            metrics.REJECTED.labels(route=ROUTE_PREDICT, reason=metrics.REASON_SCHEMA).inc()
-            raise HTTPException(status_code=422, detail=str(exc)) from None
-        except Exception as exc:  # noqa: BLE001
-            # The caller learns nothing beyond "it failed"; the operator gets the
-            # traceback. Without this the logs show only a 500 and a deterministic
-            # failure has to be reproduced in-process to be diagnosed at all.
-            metrics.REJECTED.labels(route=ROUTE_PREDICT, reason=metrics.REASON_INFERENCE).inc()
-            _log.exception(
-                "inference failed (model=%s, questions=%d)",
-                limits.sanitize_log_value(model_name or "auto"),
-                n_questions,
-            )
-            raise HTTPException(status_code=500, detail="inference failed") from None
-
-    elapsed = time.perf_counter() - started
-    checkpoint = (result.get("routing") or {}).get("model", "unknown")
-
-    # Inference time is measured, not derived: it is the whole point of having a
-    # separate histogram from the request total.
-    metrics.INFERENCE_DURATION.labels(
-        checkpoint=checkpoint, questions=str(n_questions)
-    ).observe(inference_ms / 1000.0)
-    metrics.QUEUE_WAIT.labels(route=ROUTE_PREDICT).observe(queue_s)
-    metrics.REQUEST_DURATION.labels(route=ROUTE_PREDICT, outcome="ok").observe(elapsed)
-
-    return JSONResponse(content=result, headers=_timing_headers(inference_ms))
+        return await decision.decide(
+            request,
+            payload,
+            ROUTE_PREDICT,
+            lambda body: decision.validate_predict_request(body, ROUTE_PREDICT),
+        )
 
 
 @router.post(
@@ -276,8 +140,8 @@ async def predict_batch(request: Request) -> JSONResponse:
         try:
             batch = BatchPredictRequest.model_validate(payload)
         except ValidationError as exc:
-            metrics.REJECTED.labels(route=ROUTE_BATCH, reason=metrics.REASON_SCHEMA).inc()
-            raise HTTPException(status_code=422, detail=_format_validation_error(exc)) from None
+            # `reject_schema` records the refusal and builds the 422.
+            raise decision.reject_schema(exc, ROUTE_BATCH) from None
 
         try:
             limits.refuse_body_controls(payload)
@@ -379,4 +243,4 @@ async def predict_batch(request: Request) -> JSONResponse:
     metrics.QUEUE_WAIT.labels(route=ROUTE_BATCH).observe(queue_s)
     metrics.REQUEST_DURATION.labels(route=ROUTE_BATCH, outcome="ok").observe(elapsed)
 
-    return JSONResponse(content=results, headers=_timing_headers(inference_ms))
+    return JSONResponse(content=results, headers=decision.timing_headers(inference_ms))

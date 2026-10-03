@@ -119,6 +119,8 @@ class Config:
     port: int = 8000
     root_path: str = ""
     log_level: str = "info"
+    data_dir: str = "data"
+    max_profiles: int = 32
     limits: Limits = field(default_factory=Limits)
 
     @classmethod
@@ -184,6 +186,11 @@ class Config:
             port=_int("LAYA_PORT", 8000, maximum=65535),
             root_path=_raw("LAYA_ROOT_PATH") or "",
             log_level=_raw("LAYA_LOG_LEVEL") or "info",
+            data_dir=_raw("LAYA_DATA_DIR") or "data",
+            # Capped because a profile becomes a Prometheus route label, and also
+            # because each profile pinned to a different checkpoint multiplies
+            # resident weights against a max_loaded that is deliberately small.
+            max_profiles=_int("LAYA_MAX_PROFILES", 32),
             limits=limits,
         )
 

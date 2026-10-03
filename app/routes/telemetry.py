@@ -16,6 +16,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Request, Response
 
 from app import metrics as metric_defs
+from app.calibration import min_bucket_n, min_type_n
 from app.engine import checkpoint_devices, cpu_fallbacks
 
 router = APIRouter(tags=["operations"])
@@ -51,6 +52,13 @@ async def health(request: Request) -> Dict[str, Any]:
     devices = checkpoint_devices(router_obj)
     actual = next(iter(devices.values()), None)
 
+    store = getattr(app.state, "profiles", None)
+    profile_count = 0
+    max_profiles = 0
+    if store is not None:
+        profile_count = store.count
+        max_profiles = app.state.config.max_profiles
+
     return {
         "status": "ok",
         "loaded": list(router_obj.loaded or []),
@@ -64,6 +72,20 @@ async def health(request: Request) -> Dict[str, Any]:
         "checkpoint_devices": devices,
         "cpu_fallbacks": cpu_fallbacks(router_obj),
         "torch_threads": app.state.thread_settings,
+        "profiles": {
+            "count": profile_count,
+            "max": max_profiles,
+            "at_capacity": max_profiles > 0 and profile_count >= max_profiles,
+        },
+        # The sample floors the fitter actually enforces, quoted from the SDK rather
+        # than restated in the console. Three separate numbers: too few records for
+        # any fit, too few for a per-bucket abstention threshold, too few for
+        # per-bucket temperatures or any held-out ECE score at all.
+        "calibration_floors": {
+            "type_level": min_type_n(),
+            "abstention_per_bucket": 100,
+            "per_bucket": min_bucket_n(),
+        },
         "limits": {
             "body_bytes": app.state.config.limits.body_bytes,
             "state_chars": app.state.config.limits.state_chars,

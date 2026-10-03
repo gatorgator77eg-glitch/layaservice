@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Optional
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, AsyncIterator, Optional
 
 # `transformers` probes for TensorFlow at import time, and when TensorFlow is
 # installed its abseil runtime can deadlock model construction -- the process hangs
@@ -23,13 +25,43 @@ from typing import Any, Optional
 os.environ.setdefault("USE_TF", "0")
 
 from fastapi import FastAPI  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
 
+from app.calibration import CalibrationService  # noqa: E402
 from app.config import Config, ConfigError  # noqa: E402
-from app.engine import Engine, lifespan, pin_torch_threads  # noqa: E402
+from app.engine import Engine, lifespan as engine_lifespan, pin_torch_threads  # noqa: E402
 from app.openapi import install_openapi  # noqa: E402
-from app.routes import predict, telemetry  # noqa: E402
+from app.profiles import ProfileStore  # noqa: E402
+from app.routes import admin, dynamic, predict, telemetry  # noqa: E402
 
 VERSION = "1.0.0"
+
+CONSOLE_DIR = Path(__file__).resolve().parent / "console"
+
+
+@asynccontextmanager
+async def lifespan(app: Any) -> AsyncIterator[None]:
+    """The engine's own startup, plus the calibration wiring that needs a Router.
+
+    ``app.engine.lifespan`` stays ignorant of profiles on purpose: it owns checkpoints
+    and the worker pool, and reaching into it for an optional application feature
+    would couple the two. This wrapper is where the feature-specific startup lives.
+
+    The order matters. The engine lifespan builds the Router first, and only then can
+    active calibrations be reloaded and the ``on_load`` hook be attached to the object
+    that will actually fire it. Doing it any earlier would be a no-op in production,
+    where the Router does not exist until this runs.
+    """
+    async with engine_lifespan(app):
+        service = getattr(app.state, "calibration", None)
+        if service is not None:
+            # Hook first, then restore: attaching the Router is what lets `restore`
+            # compare a fitted revision against what is actually resident, and lets it
+            # apply the temperature to an already-preloaded checkpoint instead of
+            # waiting for a load event that may never come.
+            service.install(app.state.engine.router)
+            service.restore()
+        yield
 
 DESCRIPTION = """
 A reusable inference endpoint over the Laya decision model. Give it a **state**
@@ -137,10 +169,27 @@ def create_app(config: Optional[Config] = None, router_obj: Optional[Any] = None
         app.state.thread_settings = pin_torch_threads(cfg)
         app.state.engine = Engine(router_obj, cfg)
 
+    # Profiles outlive the process, so they are read here rather than created at
+    # startup: a minted endpoint that vanished on restart would 404 for every
+    # caller with no trace of why.
+    app.state.profiles = ProfileStore(Path(cfg.data_dir))
+    app.state.calibration = CalibrationService(app.state.profiles)
+    # No calibration wiring here: in production the Router does not exist until the
+    # lifespan builds it, so `restore`/`install` belong there. With an injected Router
+    # the lifespan still runs, so both paths are covered by one implementation.
+
     install_openapi(app, version=VERSION, title="Laya Decision Service", description=DESCRIPTION)
 
     app.include_router(predict.router)
+    app.include_router(admin.router)
     app.include_router(telemetry.router)
+    app.mount("/console", StaticFiles(directory=CONSOLE_DIR, html=True), name="console")
+
+    restored = dynamic.register_all(app, app.state.profiles, cfg, app.state.calibration)
+    if restored:
+        logging.getLogger("laya_service.main").info(
+            "restored %d profile endpoint(s): %s", len(restored), ", ".join(restored)
+        )
 
     return app
 

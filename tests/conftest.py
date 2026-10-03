@@ -22,8 +22,17 @@ from tests.fake_router import FakeRouter  # noqa: E402
 
 
 @pytest.fixture
-def config() -> Config:
-    return Config(device="cpu", preload=False, max_concurrent=4, threads=1)
+def config(tmp_path) -> Config:
+    # `data_dir` is redirected per test: profiles persist to disk, and the default
+    # `data` would have the suite writing into the working tree and leaking state
+    # from one test into the next.
+    return Config(
+        device="cpu",
+        preload=False,
+        max_concurrent=4,
+        threads=1,
+        data_dir=str(tmp_path / "data"),
+    )
 
 
 @pytest.fixture

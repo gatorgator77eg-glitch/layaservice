@@ -100,6 +100,91 @@ a mixed-language workload, because each request evicts the checkpoint the next o
 
 ---
 
+## Profiles
+
+A profile is a named, stored set of questions plus the routing pins and budgets to use
+with them. Creating one mints its own endpoint, so a caller cannot drift from the
+question set it was meant to ask:
+
+```
+POST /v1/profiles                      -> 201, and POST /v1/profiles/triage/predict now exists
+GET  /v1/profiles/triage               -> the stored document
+PATCH /v1/profiles/triage              -> replace questions/routing/budgets
+DELETE /v1/profiles/triage             -> the endpoint stops existing
+PUT  /v1/profiles/triage/examples      -> replace the labelled set (JSONL rows)
+POST /v1/profiles/triage/calibration/fit        -> fit temperatures and thresholds
+POST /v1/profiles/triage/calibration/activate   -> adopt the fitted threshold
+POST /v1/profiles/triage/calibration/deactivate -> drop it
+```
+
+`GET /console` serves a static page that drives all of the above. It has no build step
+and no external resources, so it works air-gapped.
+
+**The minted endpoint has the same guards as `/v1/decisions/predict`, by
+construction.** Its handler owns no logic: it reads the body under the same byte cap,
+parses it the same way, and calls the same `app.decision.decide` core with a builder
+that merges the profile in. Body cap, malformed JSON, unpaired surrogates, token
+budgets, question limits, state size and the admission gate all apply.
+
+**The profile owns the questions.** They cannot be sent per request — an attempt is
+rejected by the schema — and routing pins and budgets come from the profile. The one
+deliberate exception is `min_confidence`: a calibrated threshold is the profile's
+default, and a caller may still override it for a single request.
+
+**Editing the questions discards the calibration.** A threshold fitted against one
+question set is not evidence about another, so the artifact is deleted rather than left
+in place to be reactivated. The fingerprint that ties a calibration to its questions is
+in the profile document.
+
+**A checkpoint update invalidates the calibration too.** A temperature is fitted for
+particular weights, so if the checkpoint is replaced underneath it — a new Hub revision,
+a re-pulled image — the stored temperature is not the right one and the threshold is
+withheld until you re-fit. A checkpoint that is merely *not loaded* is not treated as
+drift: absence of evidence is not evidence of change, and refusing there would make
+every threshold flap on and off with LRU eviction.
+
+### Calibrating a profile, and what the numbers mean
+
+Upload labelled rows — one JSON object per line, `{"state": ..., "expected": {...}}`.
+`expected` takes whatever a person would write: an option label, an index, a level name,
+or a bool for `noul`. Labels are validated on upload, so a bad one is reported with its
+row rather than surfacing later at fit time.
+
+`fit` runs the SDK's `fit_temperature_map` and `fit_abstention_thresholds`. **Read the
+floors before trusting a fit.** They are three different numbers and are reported under
+`calibration.floors` in `GET /v1/profiles/{id}/calibration`, quoted from the SDK rather
+than restated here:
+
+| Floor | Records | Below it |
+| --- | --- | --- |
+| `type_level` | 10 | Nothing is fitted; the fit is refused |
+| `abstention_per_bucket` | 100 | No abstention threshold for that bucket |
+| `per_bucket` | 2000 | No per-bucket temperature, and no held-out ECE |
+
+The `per_bucket` floor is the one that matters for interpretation, and it is **per
+bucket**: a bucket being "question type × option count", e.g. `choice:2`. 2600 records
+split over two buckets of 1300 clear the floor in total and qualify for neither. When
+that happens the fit is still real — one temperature per question type, shared across
+option counts — and the report says so via `scope: "type-level"` and a `caveat` string
+rather than presenting it as a per-bucket calibration.
+
+For the same reason `ece.available` is `false` on small fits rather than `NaN`: the SDK
+excludes any bucket that would fall below the floor once 20% is held out, and names it
+in `buckets_excluded_from_eval`. When `available` is true, `before → after` is the
+measured improvement from the fitted temperature on records the fitter did not train on.
+
+**Temperatures live on a loaded checkpoint, so activation is exclusive per checkpoint.**
+Activating a profile for a checkpoint that another active profile already owns is a
+409. This is not a policy choice — two profiles cannot hold different temperatures on
+one set of weights. Temperatures are reinstalled automatically if the Router evicts and
+reloads the checkpoint.
+
+`LAYA_MAX_LOADED` should stay at 2 or more for the same reason: a calibration never
+holds a reference to a Router-owned agent, so eviction works normally, but pinning one
+would defeat the LRU and bring back the 20–23s rebuilds.
+
+---
+
 ## Configuration
 
 All via environment variables; see `app/config.py` for the full set.
@@ -119,6 +204,13 @@ All via environment variables; see `app/config.py` for the full set.
 | `LAYA_MAX_TOTAL_OPTIONS` | `512` | Across one request |
 | `LAYA_MAX_BATCH_STATES` | `16` | States per batch call |
 | `LAYA_TOKEN_BUDGET` | `8192` | Ceiling on a caller-supplied `max_len` |
+| `LAYA_DATA_DIR` | `data` | Where profiles, examples and calibration artifacts are stored |
+| `LAYA_MAX_PROFILES` | `32` | Profiles per deployment |
+
+The profile cap is a hard operational limit, not a suggestion: each profile is a minted
+endpoint with its own metric label, so without a cap `route` would be an unbounded
+cardinality source in Prometheus. `GET /health` reports `profiles.count` and
+`at_capacity`.
 
 `USE_TF=0` is set by the app before importing `laya`, and is required. `transformers`
 probes for TensorFlow at import time, and when TensorFlow is installed its abseil runtime
@@ -338,3 +430,35 @@ There is no bearer check in this service. It is intended to sit behind an authen
 gateway, which is why `/health` may report checkpoint names, revision SHAs, device state and
 token-thread configuration. **If you expose this service directly, `/health` becomes an
 information disclosure** — put the gateway in front of it first.
+
+### Gateway routes: the console is admin, not inference
+
+This matters more now that the service can define its own endpoints. The gateway must
+route on **exact path**, not prefix:
+
+| Path | Who |
+| --- | --- |
+| `/v1/decisions/predict`, `/v1/decisions/batch`, `/v1/decisions/options` | inference callers |
+| `/v1/profiles`, `/v1/profiles/*` | administrators only |
+| `/console`, `/console/*` | administrators only |
+| `/health`, `/metrics` | your existing policy |
+
+`/v1/profiles/*` includes the minted `…/predict` endpoints. A caller-scoped rule that
+forwards `/v1/` to the inference audience would also expose profile creation, calibration
+fits and activation to that audience — and activation is what changes the confidence
+gate for every subsequent request.
+
+Two concrete reasons this is not a theoretical concern:
+
+- `POST /v1/profiles` writes to disk and mints a route. Left open, any caller can mint up
+  to `LAYA_MAX_PROFILES` endpoints and fill the metric-label cardinality.
+- `POST /v1/profiles/{id}/calibration/activate` installs temperatures onto a resident
+  checkpoint. Left open, any caller can change the confidence gate for other tenants'
+  requests.
+
+Both are refused only by the gateway. The service applies the profile cap and the
+per-checkpoint activation conflict (409), but it does not and will not authenticate.
+
+**Do not put profile examples in a multi-tenant gateway cache keyed only by path.**
+Examples and calibration artifacts are per-profile administrative state, and `/health`
+reports the profile count.

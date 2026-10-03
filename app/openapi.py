@@ -143,25 +143,45 @@ def _install_model(spec: Dict[str, Any], model: Any) -> str:
     return f"#/components/schemas/{model.__name__}"
 
 
-# Path -> request model. Imported lazily inside `build_openapi` to avoid a cycle.
-_REQUEST_BODIES = {
-    "/v1/decisions/predict": "PredictRequest",
-    "/v1/decisions/predict/batch": "BatchPredictRequest",
-}
+# (path, method) -> request model, declared by whichever module owns the route.
+#
+# The two decision endpoints and the admin endpoints all read the body off a raw
+# `Request`, so FastAPI infers nothing from their signatures and the request side of
+# the API is invisible unless it is attached by hand. A registry rather than a
+# hardcoded dict because the profile endpoints are minted at runtime: each one
+# declares its own body as it registers, and the document is regenerated when the
+# route set changes.
+_REQUEST_BODIES: Dict[Any, Any] = {}
+
+
+def declare_request_body(path: str, method: str, model: Any) -> None:
+    """Record the body model for one operation, for the document to reference."""
+    _REQUEST_BODIES[(path, method.lower())] = model
+
+
+def forget_request_body(path: str, method: str = "post") -> None:
+    """Drop a declaration when its route is removed.
+
+    Without this a deleted profile would keep a ``$ref`` in the document pointing at
+    a model for an endpoint that no longer answers, which is a client generator's
+    worst case: it emits a call that 404s.
+    """
+    _REQUEST_BODIES.pop((path, method.lower()), None)
 
 
 def _attach_request_bodies(spec: Dict[str, Any]) -> None:
-    from app import schemas as app_schemas
-
-    for path, model_name in _REQUEST_BODIES.items():
-        operation = spec.get("paths", {}).get(path, {}).get("post")
-        if operation is None:  # pragma: no cover - only if a route is renamed
+    for (path, method), model in list(_REQUEST_BODIES.items()):
+        operation = spec.get("paths", {}).get(path, {}).get(method)
+        if operation is None:
             continue
-        model = getattr(app_schemas, model_name)
+        from pydantic import BaseModel
+
+        if not (isinstance(model, type) and issubclass(model, BaseModel)):
+            continue
         ref = _install_model(spec, model)
         operation["requestBody"] = {
             "required": True,
-            "description": (operation.get("description") or "Decision request."),
+            "description": (operation.get("description") or "Request body."),
             "content": {"application/json": {"schema": {"$ref": ref}}},
         }
 
