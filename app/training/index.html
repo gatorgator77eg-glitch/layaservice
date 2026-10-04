@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Laya — Training</title>
+  <style>
+    :root {
+      --bg: #14161a;
+      --panel: #1c1f26;
+      --edge: #2b303a;
+      --ink: #e6e8ec;
+      --dim: #99a1b0;
+      --accent: #6ea8fe;
+      --good: #58c98a;
+      --warn: #e0b155;
+      --bad: #e2706a;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.55 system-ui, -apple-system, Segoe UI, sans-serif;
+    }
+
+    header {
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--edge);
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+
+    h1 {
+      font-size: 17px;
+      margin: 0;
+      font-weight: 600;
+    }
+
+    h2 {
+      font-size: 14px;
+      margin: 0 0 12px;
+      font-weight: 600;
+    }
+
+    main {
+      padding: 24px;
+      display: grid;
+      gap: 20px;
+      max-width: 1180px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--edge);
+      border-radius: 8px;
+      padding: 20px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 160px 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+
+    @media (max-width: 640px) {
+      .row {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    label {
+      color: var(--dim);
+    }
+
+    input,
+    textarea,
+    select {
+      background: #14161a;
+      color: var(--ink);
+      border: 1px solid var(--edge);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+
+    textarea {
+      min-height: 120px;
+      resize: vertical;
+    }
+
+    button {
+      background: var(--accent);
+      color: #0f172a;
+      border: none;
+      padding: 9px 14px;
+      border-radius: 6px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    button.secondary {
+      background: transparent;
+      color: var(--ink);
+      border: 1px solid var(--edge);
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .msg {
+      color: var(--dim);
+    }
+
+    .msg.ok {
+      color: var(--good);
+    }
+
+    .msg.err {
+      color: var(--bad);
+    }
+
+    .footer {
+      padding: 0 24px 24px;
+      color: var(--dim);
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <h1>Training</h1>
+    <div class="dim">Fit/prepare data-driven artifacts for profiles (UI scaffold)</div>
+    <div style="margin-left:auto; display:flex; gap:10px; flex-wrap:wrap;">
+      <a href="/home" style="color:var(--dim); text-decoration:none;">Home</a>
+      <a href="/console" style="color:var(--dim); text-decoration:none;">Console</a>
+      <a href="/models" style="color:var(--dim); text-decoration:none;">Models</a>
+    </div>
+  </header>
+  <main>
+    <section class="panel">
+      <h2>Labelled Examples → Calibration</h2>
+      <div class="msg">Use the Console to manage profiles, upload/replace examples, and fit/activate calibration. This
+        page is a placeholder for future training workflows (dataset curation, sweeps, evaluations).</div>
+      <div class="toolbar">
+        <a href="/console"><button>Open Console</button></a>
+        <a href="/v1/profiles" target="_blank"><button class="secondary">List Profiles (API)</button></a>
+        <a href="/docs" target="_blank"><button class="secondary">API Docs</button></a>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Quick Start</h2>
+      <ol>
+        <li>Create a profile in Console (questions + routing)</li>
+        <li>Add labelled examples (PUT /v1/profiles/{id}/examples)</li>
+        <li>Fit calibration (POST /v1/profiles/{id}/calibration/fit)</li>
+        <li>Activate (POST /v1/profiles/{id}/calibration/activate)</li>
+        <li>Predict via minted endpoint /v1/profiles/{id}/predict</li>
+      </ol>
+    </section>
+  </main>
+  <div class="footer">See <code>doc.txt</code> and <code>doc_monitoring.txt</code> for full API details.</div>
+</body>
+
+</html>

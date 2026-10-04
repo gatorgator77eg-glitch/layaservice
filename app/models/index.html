@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Laya — Models</title>
+  <style>
+    :root {
+      --bg: #14161a;
+      --panel: #1c1f26;
+      --edge: #2b303a;
+      --ink: #e6e8ec;
+      --dim: #99a1b0;
+      --accent: #6ea8fe;
+      --good: #58c98a;
+      --warn: #e0b155;
+      --bad: #e2706a;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.55 system-ui, -apple-system, Segoe UI, sans-serif;
+    }
+
+    header {
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--edge);
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+
+    h1 {
+      font-size: 17px;
+      margin: 0;
+      font-weight: 600;
+    }
+
+    h2 {
+      font-size: 14px;
+      margin: 0 0 12px;
+      font-weight: 600;
+    }
+
+    main {
+      padding: 24px;
+      display: grid;
+      gap: 20px;
+      max-width: 1180px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--edge);
+      border-radius: 8px;
+      padding: 20px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 160px 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+
+    @media (max-width: 640px) {
+      .row {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    label {
+      color: var(--dim);
+    }
+
+    input,
+    textarea,
+    select {
+      background: #14161a;
+      color: var(--ink);
+      border: 1px solid var(--edge);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+
+    textarea {
+      min-height: 80px;
+    }
+
+    button {
+      background: var(--accent);
+      color: #0f172a;
+      border: none;
+      padding: 9px 14px;
+      border-radius: 6px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    button.secondary {
+      background: transparent;
+      color: var(--ink);
+      border: 1px solid var(--edge);
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .msg {
+      color: var(--dim);
+      font-family: var(--mono);
+      white-space: pre-wrap;
+    }
+
+    .msg.ok {
+      color: var(--good);
+    }
+
+    .msg.err {
+      color: var(--bad);
+    }
+
+    .list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .item {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--edge);
+      border-radius: 6px;
+      padding: 10px 12px;
+      display: grid;
+      gap: 4px;
+    }
+
+    .mono {
+      font-family: var(--mono);
+    }
+
+    .footer {
+      padding: 0 24px 24px;
+      color: var(--dim);
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <h1>Models</h1>
+    <div class="dim">Manage model endpoints (add endpoint to trained model)</div>
+    <div style="margin-left:auto; display:flex; gap:10px; flex-wrap:wrap;">
+      <a href="/home" style="color:var(--dim); text-decoration:none;">Home</a>
+      <a href="/console" style="color:var(--dim); text-decoration:none;">Console</a>
+      <a href="/training" style="color:var(--dim); text-decoration:none;">Training</a>
+    </div>
+  </header>
+  <main>
+    <section class="panel">
+      <h2>Add Endpoint to Trained Model</h2>
+      <div class="row">
+        <label for="epName">Endpoint name</label>
+        <input id="epName" placeholder="e.g. triage-v1" />
+      </div>
+      <div class="row">
+        <label for="epModel">Model reference</label>
+        <input id="epModel" placeholder="checkpoint or hub/model id (e.g. english)" />
+      </div>
+      <div class="row">
+        <label for="epTask">Task (optional)</label>
+        <input id="epTask" placeholder="e.g. classification" />
+      </div>
+      <div class="row">
+        <label for="epLang">Lang (optional)</label>
+        <input id="epLang" placeholder="e.g. en" />
+      </div>
+      <div class="row">
+        <label for="epProfile">Link to profile (optional)</label>
+        <select id="epProfile"></select>
+      </div>
+      <div class="toolbar">
+        <button onclick="addEndpoint()">Add Endpoint</button>
+        <button class="secondary" onclick="loadProfiles()">Refresh Profiles</button>
+        <button class="secondary" onclick="listEndpoints()">List Endpoints</button>
+      </div>
+      <div id="msg" class="msg"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Current Profiles (for linking)</h2>
+      <div id="profiles" class="list"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Minted Profile Endpoints</h2>
+      <div class="msg">Profile endpoints are minted when profiles are created (POST /v1/profiles). This UI lists profiles
+        and their endpoints; to "add an endpoint to a trained model", create a profile that pins the trained model via
+        routing (routing.model/task/lang) or update an existing profile.</div>
+      <div id="endpoints" class="list"></div>
+    </section>
+  </main>
+  <div class="footer">See README and <code>doc.txt</code> for routing/pinning semantics.</div>
+  <script>
+    async function api(path, opts) {
+      const res = await fetch(path, Object.assign({ headers: { "content-type": "application/json" } }, opts || {}));
+      if (res.status === 204) return {};
+      const txt = await res.text();
+      let data; try { data = txt ? JSON.parse(txt) : {}; } catch { data = { raw: txt }; }
+      if (!res.ok) throw new Error((data.detail && data.detail.msg) || res.statusText);
+      return data;
+    }
+    function say(t, kind) { const m = document.getElementById('msg'); m.textContent = t; m.className = 'msg ' + (kind || ''); }
+    async function loadProfiles() {
+      try {
+        const ps = await api('/v1/profiles');
+        const sel = document.getElementById('epProfile');
+        sel.innerHTML = '<option value="">(none)</option>';
+        const list = document.getElementById('profiles');
+        list.innerHTML = '';
+        (ps.profiles || []).forEach(p => {
+          const opt = document.createElement('option'); opt.value = p.id; opt.textContent = p.id + ' — ' + p.name; sel.appendChild(opt);
+          const div = document.createElement('div'); div.className = 'item';
+          div.innerHTML = '<div class="title">' + p.id + ' · ' + p.name + '</div><div class="mono dim">' + p.endpoint + '</div><div class="dim">routing=' + JSON.stringify(p.routing) + '</div>';
+          list.appendChild(div);
+        });
+        await listEndpoints();
+      } catch (e) { say(e.message, 'err'); }
+    }
+    async function listEndpoints() {
+      try {
+        const ps = await api('/v1/profiles');
+        const div = document.getElementById('endpoints');
+        div.innerHTML = '';
+        (ps.profiles || []).forEach(p => {
+          const d = document.createElement('div'); d.className = 'item';
+          d.innerHTML = '<div><b>' + p.id + '</b> — ' + p.name + '</div><div class="mono"><a href="' + p.endpoint + '" target="_blank">' + p.endpoint + '</a></div><div class="dim mono">routing=' + JSON.stringify(p.routing) + ' budgets=' + JSON.stringify(p.budgets) + '</div>';
+          div.appendChild(d);
+        });
+      } catch (e) { say(e.message, 'err'); }
+    }
+    async function addEndpoint() {
+      const id = document.getElementById('epName').value.trim();
+      const model = document.getElementById('epModel').value.trim();
+      const task = document.getElementById('epTask').value.trim();
+      const lang = document.getElementById('epLang').value.trim();
+      const pid = document.getElementById('epProfile').value;
+      if (!id) { say('Endpoint name required', 'err'); return; }
+      try {
+        const routing = {};
+        if (model) routing.model = model;
+        if (task) routing.task = task;
+        if (lang) routing.lang = lang;
+        const body = {
+          id,
+          name: id,
+          questions: { q: { type: 'choice', instructions: 'pick', criteria: ['A', 'B'] } }, // placeholder minimal; replace via Console
+          routing
+        };
+        await api('/v1/profiles', { method: 'POST', body: JSON.stringify(body) });
+        say('Created profile/endpoint ' + id, 'ok');
+        await loadProfiles();
+      } catch (e) { say(e.message, 'err'); }
+    }
+    loadProfiles();
+  </script>
+</body>
+
+</html>

@@ -39,6 +39,8 @@ VERSION = "1.0.0"
 
 HOME_DIR = Path(__file__).resolve().parent / "home"
 CONSOLE_DIR = Path(__file__).resolve().parent / "console"
+TRAINING_DIR = Path(__file__).resolve().parent / "training"
+MODELS_DIR = Path(__file__).resolve().parent / "models"
 
 
 @asynccontextmanager
@@ -186,6 +188,8 @@ def create_app(config: Optional[Config] = None, router_obj: Optional[Any] = None
     app.include_router(admin.router)
     app.include_router(telemetry.router)
     app.mount("/home", StaticFiles(directory=HOME_DIR, html=True), name="home")
+    app.mount("/training", StaticFiles(directory=TRAINING_DIR, html=True), name="training")
+    app.mount("/models", StaticFiles(directory=MODELS_DIR, html=True), name="models")
     app.mount("/console", StaticFiles(directory=CONSOLE_DIR, html=True), name="console")
 
     @app.get("/", include_in_schema=False)
