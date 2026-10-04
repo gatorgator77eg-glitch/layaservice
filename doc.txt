@@ -1,0 +1,317 @@
+# LAYA Profiles — Developer Documentation
+
+This is the minimum necessary to create, calibrate, query, and operate the Profile Console for a project team. It covers: the contract, how a profile overrides the fixed endpoint, how calibration works (floors, staleness/drift), persistence, and concrete curl examples with the correct API paths.
+
+---
+
+## 1) Architecture: Profiles vs Fixed Decisions
+
+- Fixed: `POST /v1/decisions/predict` and batch — caller supplies `questions` (full question set) in the body.
+- Profiles: stored question sets + routing/budgets. Creating a profile mints a route `POST /v1/profiles/{id}/predict`. That route's body does **not** include `questions`, `model` or `task`. The profile owns those; the caller cannot re-route it.
+- Shared guard: `app/decision.py` is the single inference/validation core used by both. Behaviour cannot drift.
+- Governance: `ProfilePredictRequest` uses `extra="forbid"`. Unknown controls produce 422 (caller knows they misnamed something). 
+- Layering: caller controls (`lang`, `lang_guess`, `max_len`, `head_max_len`, `min_confidence`) override profile defaults only for that request; profile pins (`routing.model/task/lang`) and defaults win for everything the caller did not send. `min_confidence` is a one-request override of the calibrated threshold.
+
+### Minted endpoint (profile)
+- Path: `POST /v1/profiles/{id}/predict`
+- Request model: `ProfilePredictRequest` (see `app/schemas.py`)
+  - Required: `state` (string | dict | list). `state` must not be null (identical 422 to fixed endpoint).
+  - Optional: `lang`, `lang_guess`, `max_len`, `head_max_len`, `min_confidence` (0.0<=v<=1.0)
+- Response: identical decision shape as `/v1/decisions/predict` (shared core). 
+- Guards: enforces question limits (from profile's questions), token budgets (profile defaults + caller overrides, capped by server), and rejects schema violations with the same formatting. 
+- Routing precedence: profile routing pins are authoritative. Caller cannot supply `model`/`task`.
+
+---
+
+## 2) Profile Management (Admin)
+
+All profile CRUD, examples and calibration are admin-only in the gateway (as deployed). Paths below are the API surface.
+
+| Method | Path | Summary |
+|---|---|---|
+| GET | `/v1/profiles` | List profiles |
+| POST | `/v1/profiles` | Create a profile and mint its endpoint |
+| GET | `/v1/profiles/{id}` | Read one profile (`{"profile": {...}}`) — **no calibration** on this document |
+| PATCH | `/v1/profiles/{id}` | Update a profile |
+| DELETE | `/v1/profiles/{id}` | Delete a profile and its endpoint (also retires its calibration artifact on disk) |
+| GET | `/v1/profiles/{id}/examples` | List labelled examples |
+| PUT | `/v1/profiles/{id}/examples` | Replace labelled examples (wholesale) |
+| GET | `/v1/profiles/{id}/calibration` | Read calibration report (`{"profile_id":..., "calibration": {...}}`) |
+| POST | `/v1/profiles/{id}/calibration/fit` | Fit temperatures and thresholds |
+| POST | `/v1/profiles/{id}/calibration/activate` | Adopt a fitted threshold |
+| POST | `/v1/profiles/{id}/calibration/deactivate` | Drop the threshold |
+
+### Create
+POST `/v1/profiles` (201) with body `ProfileCreateRequest`:
+- `id` (required, 1-64, lowercase a–z0-9-_ , starts with letter or digit) — becomes path segment
+- `name` (required, 1-200)
+- `description` (optional, <=2000)
+- `questions` (required, dict of question ids -> Question). Validated via same `QUESTIONS_ADAPTER` as fixed endpoint.
+- `routing` (optional): `{model?, task?, lang?}` pins checkpoint/language
+- `budgets` (optional): `{max_len?, head_max_len?}` (>=1)
+
+Success: `{"profile": <summary>}` and endpoint exists at `/v1/profiles/{id}/predict`.
+
+### Update
+PATCH `/v1/profiles/{id}` (`ProfileUpdateRequest`, partial). 
+**Important:** if `questions` changes, the calibration artifact is **deleted** (retired). The fingerprint ties calibration to its question set; a threshold fitted to question set A means nothing for question set B.
+
+### Summary shape (list/read)
+`profile.summary()` returns:
+`{id,name,description,routing,budgets,question_ids,option_total,questions_fingerprint,created_at,updated_at,endpoint}`
+
+### ID and fingerprint
+- ID pattern enforced on write and read.
+- `questions_fingerprint` is SHA-256 of canonical JSON (keys sorted, separators compact, ensure_ascii=False). Canonicalization normalizes `criteria` forms so label lists and label/description pairs fingerprint identically.
+- On load the stored fingerprint is recomputed and must match (inconsistent stored profiles are refused).
+
+---
+
+## 3) Labelled Examples
+PUT `/v1/profiles/{id}/examples` with:
+```json
+{
+  "examples": [
+    {
+      "state": "text or document",
+      "expected": {"q1": "Positive", "q2": true},
+      "questions": { ...optional per-row override... },
+      "tags": ["train"]
+    }
+  ]
+}
+```
+- Replace wholesale (not append). Fit uses the whole set.
+- `expected` maps question id -> correct answer: option label, score level name/index, or boolean for `noul`. Expanded to one-hot internally (no positional convention).
+- `questions` per-row override is optional; omit to use profile's questions. (The console does not set this; tests may use it.)
+
+Response: `{profile_id, count, examples: [...]}`
+
+---
+
+## 4) Calibration: Fit, Activate, Deactivate
+
+### Fit
+`POST /v1/profiles/{id}/calibration/fit` (body `CalibrationFitRequest`, may be `{}`):
+- `target_error` (optional, 0<e<1): error rate the threshold targets (e.g. 0.10 => answer unless that would exceed 10% error).
+
+Behaviour:
+- Fit reads stored examples and profile questions. Examples expanded via profile questions (or per-row override if present) to one-dimensional one-hot targets.
+- Uses SDK's real record counts and `fit_temperature_map` + `fit_abstention_thresholds` (exercises real fitting maths). The test seam `records_from` exists but production uses the real SDK path.
+- Fit runs via `Engine.run` (worker thread) — does **not** hold the event loop. Response includes `queued_ms` and `fit_ms`.
+- Returns `{"profile_id","calibration": <report>}`
+
+### Activate
+`POST /v1/profiles/{id}/calibration/activate` (empty body). Adopts the fitted threshold:
+- Requires artifact exists, not stale, and has thresholds. 
+- Activation is **exclusive per checkpoint**: at most one profile's calibration may be installed on a given `model` checkpoint at a time. If another profile already holds that checkpoint, returns 409 (conflict). 
+- Installing means the Router's `on_load` hook will reinstall that temperature whenever that checkpoint is reloaded (LRU eviction), and `CalibrationService.restore()` reinstalls on startup. 
+- After preload/startup, temperatures are applied to already-resident checkpoints as well (no need to wait for a load event).
+
+### Deactivate
+`POST /v1/profiles/{id}/calibration/deactivate` (empty body). Drops the threshold for that profile; releases its checkpoint hold if active.
+
+---
+
+## 5) Calibration Report & SDK Floors
+
+`GET /v1/profiles/{id}/calibration` returns:
+```json
+{
+  "profile_id": "triage",
+  "calibration": {
+    "fitted": false|true,
+    "stale": false|true,
+    "reason": "..." | null,
+    "scope": "type-level" | "bucketed" | null,
+    "caveat": "..." | null,
+    "ece": { "available": false|true, "ece": ..., "reason": "..." } | null,
+    "floors": {
+      "type_level": 10,
+      "per_bucket": 2000,
+      "ece_holdout_frac": 0.1,
+      "abstention_per_bucket": 100
+    },
+    "questions_fingerprint": "...",
+    "fitted_at": "..." | null,
+    "n": 0|... | null,
+    "n_eval": ... | null,
+    "report": { ...SDK report... } | null,
+    "temperature": ... | null,
+    "temperature_by_options": { ... } | null,
+    "thresholds": { "<question_or_bucket>": 0.8, ... } | null,
+    "target_error": 0.10 | null,
+    "active": false|true,
+    "revision": "checkpoint-revision" | null,
+    "served": false|true
+  }
+}
+```
+
+**SDK Floors (verbatim):**
+- `type_level = 10` records minimum for any type-level temperature
+- `per_bucket = 2000` records in **one bucket** for per-bucket temperatures and held-out ECE
+- `abstention_per_bucket = 100` records per bucket for an abstention threshold
+- `ece_holdout_frac` comes from SDK
+
+Notes on scope:
+- Scope is **read back off the fitted artifact** (not inferred from total). Floors are per-bucket. Example: 2800 records split 1400/1400 clears neither per-bucket requirement → must not report `bucketed` (often ends up `type-level` with a caveat or `null` depending on what fitted). 
+- Below 2000 in a bucket → no per-bucket temperature, SDK falls back to type-level scalar (silently in effect). 
+- If data is insufficient, `fitted` may be true but `thresholds` may be null/partial and `reason`/`caveat` explain. `NaN` is never exposed as a score.
+- ECE: `available` only when hold-out data exists and per-bucket requirements met; otherwise `reason` states why.
+
+### Staleness vs Drift (critical)
+
+Two different reasons a threshold is not served:
+
+1. **Profile/question staleness** (`staleness()`): calibration was fitted for questions with fingerprint `f1`, profile now has `f2` → `reason` mentions question fingerprints. Changing `questions` in PATCH retires the artifact (deleted). This is checked on every read.
+2. **Checkpoint revision drift** (`revision_drift()`): temperature was fitted for checkpoint revision `r1`, but the currently resident checkpoint is `r2` (different weights) → threshold withheld until re-fit. 
+   - **Exception:** if the checkpoint is **not loaded** at all (not in `router.loaded_revisions`), this is **not** treated as drift. Absence of evidence is not evidence of change; refusing there would make thresholds flap on and off with LRU eviction.
+- `served = (active and artifact exists and no unservable reason)`. `report()` augments `summarize()` with router-aware `reason`/`stale`/`served`.
+- `active_revision` is not stored (removed) — the comparison is always against the router's resident revision when known.
+
+---
+
+## 6) Persistence & Configuration
+
+- Storage root: `LAYA_DATA_DIR` (env), default `data/`. All profiles, examples, artifacts live under it atomically (temp file + rename).
+- Per test: data_dir redirected to `tmp_path` (no repo `data/` created).
+- Cap: `LAYA_MAX_PROFILES` (default 32). Exceeding returns 422/limit error (enforced at write). Each profile is also a potential route label.
+- Config (env): see `app/config.py` for `LAYA_*` vars (device, preload, threads, max_concurrent, host, port, root_path, log_level, data_dir, max_profiles, limits). `threads` defaults to physical cores (override via `LAYA_THREADS`).
+- Limits: body bytes, state chars, questions, choice_options, score_levels, total_options, batch_states, token_budget (defaults tuned). Profile must satisfy limits at create/update.
+
+---
+
+## 7) Routing & Lifecycle
+
+- Dynamic routes registered on profile create, unregistered on delete. OpenAPI document regenerated on route set changes (request bodies declared via `declare_request_body`/`forget_request_body`).
+- Router lifecycle: `main.py` uses an engine lifespan. After engine creation: `service.install(app.state.engine.router)` (attach Router for revision checks), then `service.restore()` (reload active calibrations from disk). Restore installs onto already-preloaded checkpoints directly (no load-event dependency), and also via `on_load` hook for future evictions.
+- Concurrency: fit is serialized with inference on the worker (`Engine.run`). `/health` remains responsive during a fit. Response times `queued_ms`, `fit_ms` exposed where applicable.
+- Precedence: profile pins > request controls (layered). `min_confidence` in request overrides calibrated threshold for that single request only.
+
+---
+
+## 8) Health & Telemetry
+
+- `GET /health`: liveness + state. Includes `profiles` `{count, capacity, max_profiles}` and `calibration_floors` `{type_level, per_bucket, ece_holdout_frac, abstention_per_bucket}` (SDK floors).
+- `GET /metrics`: Prometheus exposition (profile metrics use bounded labels).
+
+---
+
+## 9) Console
+
+Static UI at `/console` (no external resources). 
+- Lists profiles, shows profile detail + examples + calibration report.
+- Fit/Activate/Deactivate call the calibration endpoints and re-render the report from `/calibration`.
+- Refresh reads calibration from `/calibration` (not from profile document). 
+- Guidance reflects SDK floors (type-level 10, per-bucket 2000, abstention 100).
+
+---
+
+## 10) Example API Calls (curl)
+
+Assumes base URL `http://localhost:8000` and admin access at gateway. All bodies JSON.
+
+### Create profile
+```bash
+curl -X POST http://localhost:8000/v1/profiles \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "triage",
+    "name": "Triage",
+    "questions": {
+      "sentiment": {
+        "type": "choice",
+        "criteria": [
+          {"label": "Positive"},
+          {"label": "Negative"},
+          {"label": "Neutral"}
+        ]
+      }
+    },
+    "routing": {"model": "english"}
+  }'
+```
+
+### Read profile (no calibration)
+```bash
+curl http://localhost:8000/v1/profiles/triage
+# -> {"profile": {...}}
+```
+
+### Add examples
+```bash
+curl -X PUT http://localhost:8000/v1/profiles/triage/examples \
+  -H "Content-Type: application/json" \
+  -d '{
+    "examples": [
+      {"state": "great", "expected": {"sentiment": "Positive"}},
+      {"state": "awful", "expected": {"sentiment": "Negative"}},
+      {"state": "meh", "expected": {"sentiment": "Neutral"}}
+    ]
+  }'
+```
+
+### Read calibration
+```bash
+curl http://localhost:8000/v1/profiles/triage/calibration
+# -> {"profile_id":"triage","calibration":{...}}
+```
+
+### Fit
+```bash
+curl -X POST http://localhost:8000/v1/profiles/triage/calibration/fit \
+  -H "Content-Type: application/json" \
+  -d '{"target_error": 0.10}'
+```
+
+### Activate
+```bash
+curl -X POST http://localhost:8000/v1/profiles/triage/calibration/activate \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+### Predict via minted endpoint (no questions/model/task)
+```bash
+curl -X POST http://localhost:8000/v1/profiles/triage/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "state": "this is excellent",
+    "min_confidence": 0.8
+  }'
+```
+(omit `min_confidence` to use profile's calibrated threshold when active)
+
+### Predict via fixed endpoint (caller supplies questions)
+```bash
+curl -X POST http://localhost:8000/v1/decisions/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "state": "...",
+    "questions": { "sentiment": {...} },
+    "model": "english"
+  }'
+```
+
+### Deactivate, delete
+```bash
+curl -X POST http://localhost:8000/v1/profiles/triage/calibration/deactivate \
+  -H "Content-Type: application/json" -d '{}'
+
+curl -X DELETE http://localhost:8000/v1/profiles/triage
+```
+
+---
+
+## 11) Operational Notes
+
+- **Do not launch the service** unless explicitly requested (tests and docs only here).
+- Tests: run with `USE_TF=0 python -m pytest` (105–109 passed in this repo). Data dir isolated per test.
+- **No external resources** in console (works air-gapped).
+- Gateway must enforce admin-only access to `/v1/profiles*` and `/console*` (documented in README). 
+- Checkpoint revision drift is withheld until re-fit; non-loaded checkpoints do not count as drift (prevents threshold flapping on LRU).
+- Exactly one calibration active per checkpoint at a time (409 on conflict).
+- Fit is serialized on worker; `/health` stays responsive.
+- Profile creates a Prometheus route label (consider `max_profiles` cap in large fleets). 
+- Report shape is stable before/after fit (nullable fields present). Console depends on `/calibration` endpoints.
