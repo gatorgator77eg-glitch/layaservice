@@ -21,9 +21,12 @@ seam, so the artifact shape and the gating logic are tested without a checkpoint
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from pathlib import Path
 
 from app.config import Config
 from app.main import create_app
@@ -460,6 +463,53 @@ def test_a_checkpoint_that_is_simply_not_loaded_is_not_drift(profiles_client: Te
 
     assert service.threshold_for(profile) == pytest.approx(0.8)
     assert service.report(profile)["served"] is True
+
+
+def test_the_console_reads_calibration_from_its_own_endpoint(profiles_client: TestClient) -> None:
+    """Regression: opening a profile showed "not fitted yet" even after a fit.
+
+    The console read ``data.calibration`` from ``GET /v1/profiles/{id}``, which returns
+    only ``{"profile": ...}``. That is undefined, and ``renderCal`` renders undefined as
+    "No calibration fitted yet" -- so every profile looked uncalibrated on open and on
+    every manual refresh, whichever endpoint had actually been used to fit it. A static
+    page cannot be executed here, so each ``renderCal`` argument is checked to name a
+    calibration instead, and the endpoint shapes are pinned below.
+    """
+    html = (Path(__file__).resolve().parents[1] / "app" / "console" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    # Every renderCal(data.calibration) must be fed by a call to a /calibration
+    # endpoint. Two of them were fed by GET /v1/profiles/{id}, which returns only
+    # {"profile": ...}: the value was undefined and the panel claimed no calibration
+    # existed for any profile, on open and on every manual refresh.
+    args = [
+        match.group(1)
+        for match in re.finditer(r"(?<!function )renderCal\(([^()]*)\)", html)
+        if not html[max(0, match.start() - 9) : match.start()].endswith("function")
+    ]
+    assert args, "console no longer renders a calibration report"
+    for arg in args:
+        assert "calibration" in arg, (
+            f"renderCal is fed {arg!r}, which carries no calibration"
+        )
+    assert "data.profile.calibration" not in html
+
+    create(profiles_client, document={**SIMPLE, "routing": {"model": "english"}})
+    body = profiles_client.get("/v1/profiles/triage").json()
+    assert "calibration" not in body["profile"]
+    report = profiles_client.get("/v1/profiles/triage/calibration").json()
+    assert "fitted" in report["calibration"] and "reason" in report["calibration"]
+
+
+def test_a_fitted_profile_reports_the_fields_the_console_renders(profiles_client: TestClient) -> None:
+    """Every key ``renderCal`` reads must exist on the report, even before a fit.
+
+    Otherwise the console silently shows "?" for a value it should be displaying.
+    """
+    create(profiles_client, document={**SIMPLE, "routing": {"model": "english"}})
+    cal = profiles_client.get("/v1/profiles/triage/calibration").json()["calibration"]
+    for key in ("fitted", "stale", "reason", "scope", "floors", "n", "active", "thresholds"):
+        assert key in cal, f"report is missing {key!r}, which the console renders"
 
 
 def test_profile_cap_is_enforced(profiles_client: TestClient) -> None:

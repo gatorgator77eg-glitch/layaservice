@@ -274,7 +274,12 @@ async function select(id) {
   $("c-examples").value = examples.examples.length
     ? examples.examples.map((e) => JSON.stringify(e)).join("\n")
     : "";
-  renderCal(data.calibration);
+
+  // The calibration lives behind its own endpoint. Reading it off the profile
+  // document yielded undefined here and the panel said "not fitted yet" for a
+  // profile that had been fitted, on every open.
+  const cal = await api("/v1/profiles/" + encodeURIComponent(id) + "/calibration");
+  renderCal(cal.calibration);
   await load();
 }
 
@@ -446,7 +451,8 @@ $("deactivateBtn").onclick = async () => {
 $("refreshCal").onclick = async () => {
   if (!selected) return;
   try {
-    const data = await api("/v1/profiles/" + encodeURIComponent(selected));
+    const data = await api(
+      "/v1/profiles/" + encodeURIComponent(selected) + "/calibration");
     renderCal(data.calibration);
     say("calMsg", "", null);
   } catch (e) { say("calMsg", e.message, "err"); }

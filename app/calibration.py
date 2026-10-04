@@ -390,6 +390,19 @@ def summarize(
             "abstention_per_bucket": 100,
         },
         "questions_fingerprint": profile.questions_fingerprint,
+        # Present as null before the first fit rather than absent. The report's shape
+        # then does not change under a client depending on when it happens to look,
+        # and a consumer reading a key it expects never has to guard for its absence.
+        "fitted_at": None,
+        "n": None,
+        "n_eval": None,
+        "report": None,
+        "temperature": None,
+        "temperature_by_options": None,
+        "thresholds": None,
+        "target_error": None,
+        "revision": None,
+        "active": False,
     }
     if artifact:
         payload.update(
