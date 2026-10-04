@@ -25,6 +25,7 @@ from typing import Any, AsyncIterator, Optional
 os.environ.setdefault("USE_TF", "0")
 
 from fastapi import FastAPI  # noqa: E402
+from fastapi.responses import HTMLResponse, RedirectResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from app.calibration import CalibrationService  # noqa: E402
@@ -36,6 +37,7 @@ from app.routes import admin, dynamic, predict, telemetry  # noqa: E402
 
 VERSION = "1.0.0"
 
+HOME_DIR = Path(__file__).resolve().parent / "home"
 CONSOLE_DIR = Path(__file__).resolve().parent / "console"
 
 
@@ -183,7 +185,16 @@ def create_app(config: Optional[Config] = None, router_obj: Optional[Any] = None
     app.include_router(predict.router)
     app.include_router(admin.router)
     app.include_router(telemetry.router)
+    app.mount("/home", StaticFiles(directory=HOME_DIR, html=True), name="home")
     app.mount("/console", StaticFiles(directory=CONSOLE_DIR, html=True), name="console")
+
+    @app.get("/", include_in_schema=False)
+    async def root() -> RedirectResponse:
+        return RedirectResponse(url="/home")
+
+    @app.get("/ui", include_in_schema=False)
+    async def ui_root() -> RedirectResponse:
+        return RedirectResponse(url="/home")
 
     restored = dynamic.register_all(app, app.state.profiles, cfg, app.state.calibration)
     if restored:
