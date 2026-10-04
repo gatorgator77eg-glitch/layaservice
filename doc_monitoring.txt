@@ -1,0 +1,139 @@
+# Real-Time Monitoring: Who Is Using What
+
+This page documents how to observe live usage of Profiles via Prometheus metrics exposed at `/metrics`. It covers which series exist, what labels mean (especially per-profile routes), example queries, and how to build a simple "who is using what" dashboard.
+
+## 1) Exposing Metrics
+- Endpoint: `GET /metrics` (not in OpenAPI schema)
+- Format: Prometheus text exposition
+- Source: `app/metrics.py` (registry), rendered by `app.routes.telemetry.scrape()`
+- All metrics below come from the shared core (`app.decision.decide`) and from minted profile endpoints (`app.routes.dynamic`). The fixed endpoints (`/v1/decisions/predict` and batch) use route labels `predict` and `batch`.
+
+## 2) Route Labeling (Key to "Who is Using What")
+- Fixed predict: route = `predict`
+- Fixed batch: route = `batch`
+- Minted profile predict: route = `profile:{profile_id}` (from `app.routes.dynamic.route_label`)
+- Rationale: per-profile latency/counts identify which question set is hot; the label is bounded by `LAYA_MAX_PROFILES` (default 32) to avoid unbounded cardinality.
+- Checkpoint label (where applicable): `checkpoint` ∈ {"english","multilingual","typed-decisions"} (see `app/metrics.py` initialization of checkpoint-labeled series).
+
+## 3) Core Metrics (with labels)
+
+| Metric | Type | Labels | Notes |
+|---|---|---|---|
+| `laya_requests_total` | Counter | (`route`, `status`) | Total requests by route and outcome. Profile routes appear as `route="profile:<id>"`. Status values set where REQUESTS is incremented (not currently incremented in codebase paths shown; see gaps below). |
+| `laya_request_duration_seconds` | Histogram | (`route`, `outcome`) | End-to-end request duration including queue wait. Profile routes appear as `route="profile:<id>"`, outcome typically `ok`. Buckets defined in `LATENCY_BUCKETS`. |
+| `laya_queue_wait_seconds` | Histogram | (`route`) | Time from admission to inference-gate acquisition (queue/concurrency). Profile routes use `route="profile:<id>"`. |
+| `laya_inference_duration_seconds` | Histogram | (`checkpoint`, `questions`) | Forward-pass duration. `questions` is the number of questions in that decision (string/number label). Checkpoint is the loaded checkpoint used. This is checkpoint-scoped, not per-profile id. |
+| `laya_inference_in_flight` | Gauge | (none) | Inference passes currently executing (0 or 1). >0 for longer than one forward pass indicates worker wedged. |
+| `laya_rejected_total` | Counter | (`route`, `reason`) | Rejections before inference, by guard. Profile routes include `route="profile:<id>"`. Reasons: `schema`, `body`, `json`, `state`, `questions`, `choice_options`, `score_levels`, `total_options`, `batch_states`, `surrogate`, `body_control`, `budget`, `admission`, `inference` (see `app/metrics.py` REASON_*). |
+| `laya_checkpoint_evictions_total` | Counter | (none) | Resident checkpoints evicted by LRU cap. |
+
+Notes on REQUESTS_TOTAL: The registry defines `laya_requests_total` with labels (`route`,`status`) and initializes zero values for known routes/checkpoints, but the current code paths increment `REQUEST_DURATION` on success and `REJECTED` on pre-inference failures; `REQUESTS` itself is not explicitly incremented in the shown request paths. Treat `REQUEST_DURATION` counts (`_count`) and `REJECTED` as the primary request accounting, or add increments if you need a separate status-labeled counter.
+
+## 4) "Who Is Using What" — Live Queries (PromQL)
+
+### Active profiles with request rate (last 5m)
+Profile endpoints emit request durations with route label `profile:<id>`. Use histogram rate on `_count`:
+```promql
+sum by (route) (
+  rate(laya_request_duration_seconds_count{outcome="ok", route=~"profile:.*"}[5m])
+)
+```
+
+### Top profiles by request rate (5m)
+```promql
+topk(10, sum by (route) (
+  rate(laya_request_duration_seconds_count{outcome="ok", route=~"profile:.*"}[5m])
+))
+```
+
+### Rejection rate per profile (5m)
+```promql
+sum by (route, reason) (
+  rate(laya_rejected_total{route=~"profile:.*"}[5m])
+)
+```
+
+### P95/P99 latency per profile (5m)
+```promql
+histogram_quantile(0.95,
+  sum by (le, route) (
+    rate(laya_request_duration_seconds_bucket{outcome="ok", route=~"profile:.*"}[5m])
+  )
+)
+```
+```promql
+histogram_quantile(0.99,
+  sum by (le, route) (
+    rate(laya_request_duration_seconds_bucket{outcome="ok", route=~"profile:.*"}[5m])
+  )
+)
+```
+
+### Queue wait per profile (P95, 5m)
+```promql
+histogram_quantile(0.95,
+  sum by (le, route) (
+    rate(laya_queue_wait_seconds_bucket{route=~"profile:.*"}[5m])
+  )
+)
+```
+
+### Inference duration by checkpoint and questions (P95, 5m) — checkpoint-scoped, not per-profile
+```promql
+histogram_quantile(0.95,
+  sum by (le, checkpoint, questions) (
+    rate(laya_inference_duration_seconds_bucket[5m])
+  )
+)
+```
+
+### In-flight inference (should be 0 or 1)
+```promql
+laya_inference_in_flight
+```
+
+### Evictions
+```promql
+increase(laya_checkpoint_evictions_total[1h])
+```
+
+### Compare fixed vs profile traffic
+```promql
+sum by (route) (
+  rate(laya_request_duration_seconds_count{outcome="ok"}[5m])
+)
+```
+
+## 5) Sample Scrape (what you will see)
+After hitting `POST /v1/profiles/p1/predict` once, `/metrics` includes series like:
+- `laya_request_duration_seconds_bucket{le="7.5",outcome="ok",route="profile:p1"} 1.0`
+- `laya_request_duration_seconds_count{outcome="ok",route="profile:p1"} 1.0`
+- `laya_request_duration_seconds_sum{outcome="ok",route="profile:p1"} ...`
+- `laya_queue_wait_seconds_bucket{le="0.005",route="profile:p1"} 1.0`
+- `laya_inference_duration_seconds_bucket{checkpoint="english",le="0.005",questions="1"} 0.0` (checkpoint-scoped)
+- `laya_rejected_total{reason="schema",route="profile:p1"} 1.0` (on 422)
+
+## 6) Building a "Who is Using What" Panel
+
+Recommended panel set (Grafana/Prometheus):
+1. **Profile Request Rate (req/s)** — stacked bar by `route` regex `profile:.*`
+2. **Active Profiles** — count of profiles with `rate(...count[5m]) > 0`
+3. **P95/P99 Latency by Profile** — heatmap/line by route
+4. **Queue Wait P95 by Profile** — identify contention
+5. **Rejections by Profile+Reason** — top offenders
+6. **Inference by Checkpoint/Questions** — shows which question sets drive model time (checkpoint-scoped)
+7. **In-Flight & Evictions** — health signals
+
+Example "active profiles" query:
+```promql
+count(count by (route) (
+  rate(laya_request_duration_seconds_count{route=~"profile:.*"}[5m])
+))
+```
+
+## 7) Operations Notes
+- Profile id is the identifier created via `POST /v1/profiles` and appears verbatim in `route="profile:{id}"`. It is URL-safe (lowercase a–z0–9-_).
+- Cardinality: bounded by `max_profiles` (<=32). Do not create arbitrary dynamic ids; cap is enforced.
+- Health also exposes `profiles.count`/`capacity` and calibration floors at `/health` (separate from `/metrics`).
+- `/metrics` includes `laya_requests_total` definition but increments are not present in all request paths in this codebase; prefer histogram `_count` for throughput and `laya_rejected_total` for failures. If you require status-labeled totals, add `metrics.REQUESTS.labels(route=..., status=...).inc()` on success/failure paths.
+- Calibration state does not appear as Prometheus series here; monitor via `/health` and the calibration report endpoints.
